@@ -1,6 +1,7 @@
 import json
 import os, re, sys, subprocess, platform
 import tarfile
+import time
 from distutils import log
 from contextlib import closing, contextmanager
 from ftplib import FTP
@@ -118,7 +119,29 @@ def unpack_zipfile(zipfn, destdir):
     finally:
         f.close()
     assert os.path.exists(extracted_dir), 'missing: %s' % extracted_dir
+    remove_pdb_files(extracted_dir)
     return extracted_dir
+
+
+def remove_pdb_files(directory):
+    # The prebuilt Windows binaries ship static libs built with /GL (LTCG), so
+    # MSVC still runs a link time code generation pass over their objects.  That
+    # pass tries to open the matching *.pdb files, which are either missing from
+    # the release drop or were written by a mismatched toolset, and the link then
+    # dies with "fatal error C1090: PDB API call failed, error code '5'" plus
+    # "LNK1257 / LNK1327".  PDBs are pure debug information and are not needed to
+    # link, so delete them: without them the linker only emits the benign
+    # "LNK4099: PDB was not found" warning.
+    for dir_path, _dir_names, filenames in os.walk(directory):
+        for filename in filenames:
+            if filename.lower().endswith('.pdb'):
+                pdb_file = os.path.join(dir_path, filename)
+                try:
+                    os.unlink(pdb_file)
+                except OSError as exc:
+                    print('Failed to remove %s: %s' % (pdb_file, exc))
+                else:
+                    print('Removed %s' % pdb_file)
 
 
 def get_prebuilt_libxml2xslt(download_dir, static_include_dirs, static_library_dirs):
@@ -138,8 +161,23 @@ def get_prebuilt_libxml2xslt(download_dir, static_include_dirs, static_library_d
 LIBXML2_LOCATION = 'https://download.gnome.org/sources/libxml2/'
 LIBXSLT_LOCATION = 'https://download.gnome.org/sources/libxslt/'
 LIBICONV_LOCATION = 'https://ftp.gnu.org/pub/gnu/libiconv/'
+# Superseded zlib releases are moved out of the main directory into "fossils/",
+# and the GitHub release assets are version addressed, so those two serve a
+# pinned (i.e. usually no longer current) version, whereas the main directory
+# only ever serves the very latest release, and 404s for anything else.
+# ZLIB_LOCATION therefore comes last, for the case where the pin does name the
+# current release. (LIBICONV_LOCATION keeps every historic release in the one
+# directory, so it needs no such ordering.)
 ZLIB_LOCATION = 'https://zlib.net/'
+ZLIB_FOSSILS_LOCATION = 'https://zlib.net/fossils/'
+ZLIB_GITHUB_LOCATION = 'https://github.com/madler/zlib/releases/download/v%s/'
 match_libfile_version = re.compile('^[^-]*-([.0-9-]+)[.].*').match
+
+# Versions embedded in the reference wheels.
+LIBICONV_VERSION = '1.17'
+# zlib 1.3's pre-1.3.1 "fdopen" macro breaks the current macOS SDK headers
+# ("_stdio.h:322:7: error: expected identifier or '('"), so use 1.3.1 there.
+ZLIB_VERSION = '1.3.1' if sys_platform == 'darwin' else '1.3'
 
 
 def _find_content_encoding(response, default='iso8859-1'):
@@ -299,15 +337,21 @@ def download_libiconv(dest_dir, version=None):
     version_re = re.compile(r'libiconv-([0-9.]+[0-9]).tar.gz')
     filename = 'libiconv-%s.tar.gz'
     return download_library(dest_dir, LIBICONV_LOCATION, 'libiconv',
-                            version_re, filename, version=version)
+                            version_re, filename,
+                            version=version or LIBICONV_VERSION)
 
 
 def download_zlib(dest_dir, version):
     """Downloads zlib, returning the filename where the library was downloaded"""
     version_re = re.compile(r'zlib-([0-9.]+[0-9]).tar.gz')
     filename = 'zlib-%s.tar.gz'
-    return download_library(dest_dir, ZLIB_LOCATION, 'zlib',
-                            version_re, filename, version=version)
+    version = version or ZLIB_VERSION
+    return download_library(dest_dir, ZLIB_FOSSILS_LOCATION, 'zlib',
+                            version_re, filename, version=version,
+                            fallback_locations=[
+                                ZLIB_GITHUB_LOCATION % version,
+                                ZLIB_LOCATION,
+                            ])
 
 
 def find_max_version(libname, filenames, version_re=None):
@@ -330,7 +374,47 @@ def find_max_version(libname, filenames, version_re=None):
     return version_string
 
 
-def download_library(dest_dir, location, name, version_re, filename, version=None):
+ARCHIVE_MAGIC_BYTES = (
+    b'\x1f\x8b',      # gzip
+    b'BZh',           # bzip2
+    b'\xfd7zXZ',      # xz
+    b'PK',            # zip
+)
+
+
+def _is_archive_file(filename):
+    try:
+        with open(filename, 'rb') as f:
+            header = f.read(8)
+    except IOError:
+        return False
+    return any(header.startswith(magic) for magic in ARCHIVE_MAGIC_BYTES)
+
+
+def _download_file(full_url, dest_filename):
+    """Download one file, returning None on success, or the reason it failed.
+
+    A failed urlretrieve() leaves the HTTP error body behind on disk, and some
+    mirrors intermittently serve a non-archive body with a 200 status, so always
+    delete the destination first and validate what we ended up with.
+    """
+    if os.path.exists(dest_filename):
+        os.unlink(dest_filename)
+    print('Downloading %s from %s' % (dest_filename, full_url))
+    urlcleanup()  # work around FTP bug 27973 in Py2.7.12
+    try:
+        urlretrieve(full_url, dest_filename)
+    except Exception as exc:
+        print('Download from %s failed: %s' % (full_url, exc))
+        return '%s: %s' % (type(exc).__name__, exc)
+    if not _is_archive_file(dest_filename):
+        print('Download from %s did not return an archive file' % full_url)
+        return 'response body was not an archive file'
+    return None
+
+
+def download_library(dest_dir, location, name, version_re, filename, version=None,
+                     fallback_locations=None):
     if version is None:
         try:
             if location.startswith('ftp://'):
@@ -356,17 +440,36 @@ def download_library(dest_dir, location, name, version_re, filename, version=Non
                 raise
     if version:
         filename = filename % version
-    full_url = urljoin(location, filename)
     dest_filename = os.path.join(dest_dir, filename)
-    if os.path.exists(dest_filename):
+    if os.path.exists(dest_filename) and _is_archive_file(dest_filename):
         print(('Using existing %s downloaded into %s '
                '(delete this file if you want to re-download the package)') % (
             name, dest_filename))
-    else:
-        print('Downloading %s into %s from %s' % (name, dest_filename, full_url))
-        urlcleanup()  # work around FTP bug 27973 in Py2.7.12
-        urlretrieve(full_url, dest_filename)
-    return dest_filename
+        return dest_filename
+
+    # Try the main location first, then any fallback mirrors, several times each
+    # with a short linear backoff, so that a transient rate limit or a truncated
+    # body gets a real second chance before we move on.
+    locations = [location] + list(fallback_locations or ())
+    attempts_per_location = 4
+    failures = []
+    for location_index, attempt_location in enumerate(locations):
+        full_url = urljoin(attempt_location, filename)
+        for attempt in range(1, attempts_per_location + 1):
+            error = _download_file(full_url, dest_filename)
+            if error is None:
+                return dest_filename
+            failures.append('  %s (attempt %d/%d): %s' % (
+                full_url, attempt, attempts_per_location, error))
+            last_attempt_of_last_location = (
+                attempt == attempts_per_location
+                and location_index == len(locations) - 1)
+            if not last_attempt_of_last_location:
+                time.sleep(attempt * 2)
+    if os.path.exists(dest_filename):
+        os.unlink(dest_filename)
+    raise Exception('Downloading %s failed, tried:\n%s' % (
+        name, '\n'.join(failures)))
 
 
 def unpack_tarball(tar_filename, dest):

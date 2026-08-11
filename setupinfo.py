@@ -123,6 +123,13 @@ def ext_modules(static_include_dirs, static_library_dirs,
     _library_dirs = _prefer_reldirs(base_dir, library_dirs(static_library_dirs))
     _cflags = cflags(static_cflags)
     _ldflags = ['-isysroot', get_xcode_isysroot()] if sys.platform == 'darwin' else None
+    if sys.platform == 'win32':
+        # '/GL' and '/LTCG' are removed from distutils' MSVC defaults by the
+        # monkeypatch in setup.py, so nothing has to be overridden here.
+        # '/DEBUG:NONE' keeps the linker from consulting the input PDBs of the
+        # prebuilt static libs, whose mismatched/absent PDBs otherwise make it
+        # fail with "C1090: PDB API call failed".
+        _ldflags = ['/DEBUG:NONE']
     _define_macros = define_macros()
     _libraries = libraries()
 
@@ -162,7 +169,8 @@ def ext_modules(static_include_dirs, static_library_dirs,
                 sources = [main_module_source],
                 depends = find_dependencies(module),
                 extra_compile_args = _cflags,
-                extra_link_args = None if is_py else _ldflags,
+                # the '/DEBUG:NONE' flag applies to every module on Windows
+                extra_link_args = _ldflags if (not is_py or sys.platform == 'win32') else None,
                 extra_objects = None if is_py else static_binaries,
                 define_macros = _define_macros,
                 include_dirs = _include_dirs,

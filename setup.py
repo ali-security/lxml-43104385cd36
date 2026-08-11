@@ -16,6 +16,73 @@ try:
 except ImportError:
     from distutils.core import setup
 
+
+# Windows: strip whole-program-optimisation / link-time-code-generation from
+# distutils' hard-coded MSVC defaults.
+#
+# distutils' MSVCCompiler.initialize() compiles with '/GL' and links with
+# '/LTCG'.  We link against the prebuilt static libs from
+# lxml/libxml2-win-binaries (libxml2_a.lib, libxslt_a.lib, libexslt_a.lib,
+# iconv_a.lib), which were produced by a different MSVC toolchain and carry
+# '/GL' objects whose PDBs the LTCG pass cannot read.  The link then dies with
+#   iconv.c : fatal error C1090: PDB API call failed, error code '5'
+#   LINK : fatal error LNK1257: code generation failed
+# Appending an override is not enough: distutils puts its own '/LTCG' at the
+# *front* of the link command line, where it beats a trailing '/LTCG:OFF'.
+# The flags have to be removed from the defaults instead, so we patch
+# initialize() and scrub the instance's flag lists after it has run.
+def _patch_msvc_disable_ltcg():
+    if sys.platform != 'win32':
+        return
+
+    _msvccompiler = None
+    for _import in ('setuptools._distutils', 'distutils'):
+        try:
+            _msvccompiler = __import__(
+                _import + '._msvccompiler', fromlist=['_msvccompiler'])
+        except ImportError:
+            continue
+        else:
+            break
+    if _msvccompiler is None:
+        return
+
+    compiler_class = getattr(_msvccompiler, 'MSVCCompiler', None)
+    if compiler_class is None:
+        return
+
+    def strip_ltcg_flags(compiler):
+        """Remove '/GL' from compile flags and '/LTCG*' from link flags."""
+        for attr_name in dir(compiler):
+            if not (attr_name.startswith('compile_options')
+                    or attr_name.startswith('ldflags')):
+                continue
+            flags = getattr(compiler, attr_name, None)
+            if not isinstance(flags, list):
+                continue
+            cleaned = [
+                flag for flag in flags
+                if flag.upper() != '/GL'
+                and not flag.upper().startswith('/LTCG')
+            ]
+            if cleaned != flags:
+                setattr(compiler, attr_name, cleaned)
+
+    original_initialize = compiler_class.initialize
+
+    def initialize(self, *args, **kwargs):
+        result = original_initialize(self, *args, **kwargs)
+        strip_ltcg_flags(self)
+        return result
+
+    compiler_class.initialize = initialize
+    print("Patched MSVCCompiler.initialize() to drop /GL and /LTCG "
+          "(prebuilt libxml2/libxslt/libiconv static libs break LTCG: "
+          "C1090 -> LNK1257).")
+
+
+_patch_msvc_disable_ltcg()
+
 # make sure Cython finds include files in the project directory and not outside
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 

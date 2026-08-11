@@ -33,6 +33,18 @@ MANYLINUX_IMAGES= \
 	musllinux_1_1_x86_64 \
     musllinux_1_1_aarch64
 
+# The ':latest' tag of these images has drifted (gcc-toolset-14 makes
+# -Wincompatible-pointer-types fatal, adds cp313 and drops cp36-cp38),
+# so pin them to the last known good tag.  The manylinux_2_24_* images are
+# archived and no longer move, so ':latest' is correct for those.
+PINNED_IMAGE_TAG=2023-12-18-e7e3b8c
+IMAGE_TAG_DEFAULT=latest
+IMAGE_TAG_manylinux_2_28_x86_64=$(PINNED_IMAGE_TAG)
+IMAGE_TAG_manylinux_2_28_aarch64=$(PINNED_IMAGE_TAG)
+IMAGE_TAG_musllinux_1_1_x86_64=$(PINNED_IMAGE_TAG)
+IMAGE_TAG_musllinux_1_1_aarch64=$(PINNED_IMAGE_TAG)
+IMAGE_TAG_manylinux2014_aarch64=$(PINNED_IMAGE_TAG)
+
 .PHONY: all inplace inplace3 rebuild-sdist sdist build require-cython wheel_manylinux wheel
 
 all: inplace
@@ -65,7 +77,6 @@ qemu-user-static:
 	docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
 
 wheel_manylinux: $(addprefix wheel_,$(MANYLINUX_IMAGES))
-$(addprefix wheel_,$(filter-out %_x86_64, $(filter-out %_i686, $(MANYLINUX_IMAGES)))): qemu-user-static
 
 wheel_%: dist/lxml-$(LXMLVERSION).tar.gz
 	time docker run --rm -t \
@@ -79,8 +90,9 @@ wheel_%: dist/lxml-$(LXMLVERSION).tar.gz
 		-e LIBXML2_VERSION="$(MANYLINUX_LIBXML2_VERSION)" \
 		-e LIBXSLT_VERSION="$(MANYLINUX_LIBXSLT_VERSION)" \
 		-e PYTHON_BUILD_VERSION="$(PYTHON_BUILD_VERSION)" \
+		-e PIP_INDEX_URL="$(PIP_INDEX_URL)" \
 		-e WHEELHOUSE=$(subst wheel_,wheelhouse/,$@) \
-		quay.io/pypa/$(subst wheel_,,$@) \
+		quay.io/pypa/$(subst wheel_,,$@):$(or $(IMAGE_TAG_$(subst wheel_,,$@)),$(IMAGE_TAG_DEFAULT)) \
 		bash /io/tools/manylinux/build-wheels.sh /io/$<
 
 wheel:

@@ -1,14 +1,14 @@
 name: Wheel build
 
 on:
-  release:
-    types: [created]
+  workflow_dispatch:
 
 permissions: {}
 
 jobs:
   sdist:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     permissions:
       contents: write
@@ -19,13 +19,13 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: "3.x"
+        python-version: "3.12"
 
     - name: Install lib dependencies
-      run: sudo apt-get update -y -q && sudo apt-get install -y -q "libxml2=2.9.13*" "libxml2-dev=2.9.13*" libxslt1.1 libxslt1-dev
+      run: sudo apt-get update -y -q && sudo apt-get install -y -q libxml2 libxml2-dev libxslt1.1 libxslt1-dev
 
     - name: Install Python dependencies
-      run: python -m pip install -U pip setuptools && python -m pip install -U docutils pygments sphinx sphinx-rtd-theme -r requirements.txt
+      run: python -m pip install -U pip && python -m pip install -U docutils pygments sphinx sphinx-rtd-theme -r requirements.txt && python -m pip install --force-reinstall --upgrade "setuptools<70"
 
     - name: Build docs and sdist
       run: make html sdist
@@ -38,19 +38,14 @@ jobs:
         files: dist/*.tar.gz
 
     - name: Upload sdist
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: sdist
         path: dist/*.tar.gz
 
-    - name: Upload website
-      uses: actions/upload-artifact@v3
-      with:
-        name: website
-        path: doc/html
-
   Linux:
-    runs-on: ubuntu-latest
+    runs-on: ${{ contains(matrix.image, 'aarch64') && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 120
 
     permissions:
       contents: write
@@ -77,6 +72,10 @@ jobs:
             pyversion: "*"
           - image: musllinux_1_1_aarch64
             pyversion: "*"
+          # archived manylinux_2_24 image has no /opt/python/cp312*, and upstream
+          # published no cp312 manylinux_2_24 wheel (cp312 ships 2_28 + musllinux)
+          - image: manylinux_2_24_aarch64
+            pyversion: "cp312*"
         include:
           - image: manylinux2014_aarch64
             pyversion: "cp36*"
@@ -92,8 +91,6 @@ jobs:
             pyversion: "cp311*"
           - image: manylinux_2_28_aarch64
             pyversion: "cp311*"
-          - image: manylinux_2_24_aarch64
-            pyversion: "cp312*"
           - image: manylinux_2_28_aarch64
             pyversion: "cp312*"
 
@@ -121,10 +118,10 @@ jobs:
         python-version: "3.11"
 
     - name: Install lib dependencies
-      run: sudo apt-get update -y -q && sudo apt-get install -y -q "libxml2=2.9.13*" "libxml2-dev=2.9.13*" libxslt1.1 libxslt1-dev
+      run: sudo apt-get update -y -q && sudo apt-get install -y -q libxml2 libxml2-dev libxslt1.1 libxslt1-dev
 
     - name: Install dependencies
-      run: python -m pip install -r requirements.txt
+      run: python -m pip install -r requirements.txt && python -m pip install --force-reinstall --upgrade "setuptools<70"
 
     - name: Build sdist
       run: make sdist
@@ -141,9 +138,10 @@ jobs:
         files: wheelhouse/*/*-m*linux*.whl  # manylinux / musllinux
 
     - name: Upload wheels
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
-        name: wheels-${{ matrix.image }}
+        # v4 needs unique names per leg and forbids '*' (matrix.pyversion is "*"/"cp312*")
+        name: wheels-${{ matrix.image }}-${{ strategy.job-index }}
         path: wheelhouse/*/*-m*linux*.whl  # manylinux / musllinux
         if-no-files-found: ignore
 
@@ -153,7 +151,7 @@ jobs:
       fail-fast: false
 
       matrix:
-        os: [macos-latest, windows-2019]
+        os: [macos-latest, windows-latest]
         #os: [macos-10.15, windows-latest]
         #os: [macos-10.15]
         python-version:
@@ -173,10 +171,20 @@ jobs:
         #  - os: windows-2016
         #    python-version: 2.7
         exclude:
-          - os: windows-2019
+          - os: windows-latest
             python-version: 2.7  # needs older image
+          # "Set up Python" is gated to 3.*/pypy, so 2.7 gets no interpreter on
+          # current macOS images, and upstream published no macOS cp27 wheel
+          - os: macos-latest
+            python-version: 2.7
 
-    runs-on: ${{ matrix.os }}
+    # macOS 3.6/3.7 have no arm64 setup-python build -> route them to intel
+    # macOS: only 3.11/3.12 stay on the arm64 macos-latest image (upstream published
+    # macosx_11_0_universal2 for those two). Every other macOS leg goes to the Intel
+    # image: 3.6/3.7 and pypy-3.8 have no arm64 setup-python build at all, and upstream
+    # published macosx_11_0_x86_64 for cp36/cp39/cp310 and for all PyPy legs.
+    runs-on: ${{ (matrix.os == 'macos-latest' && !contains(fromJSON('["3.11","3.12"]'), matrix.python-version)) && 'macos-15-intel' || matrix.os }}
+    timeout-minutes: 120
 
     permissions:
       contents: write
@@ -199,7 +207,17 @@ jobs:
         ln -s /usr/local/bin/glibtoolize /usr/local/bin/libtoolize
 
     - name: Install dependencies
-      run: python -m pip install setuptools wheel -r requirements.txt
+      run: python -m pip install setuptools wheel -r requirements.txt && python -m pip install --force-reinstall --upgrade "setuptools<70"
+
+    # setup-python's macOS x86_64 CPython builds for 3.8/3.9/3.10 carry a
+    # MACOSX_DEPLOYMENT_TARGET of 13.0/15.0, so bdist_wheel tags them
+    # macosx_13_0/macosx_15_0 and the job-level MACOSX_DEPLOYMENT_TARGET=11.0 is
+    # ignored (distutils refuses to lower it).  Upstream published these as
+    # macosx_11_0_x86_64, so pin the reported host platform for the Intel macOS
+    # legs.  Only the wheel's platform tag changes; the binary is unaffected.
+    - name: Pin macOS wheel platform tag
+      if: runner.os == 'macOS' && runner.arch == 'X64'
+      run: echo "_PYTHON_HOST_PLATFORM=macosx-11.0-x86_64" >> $GITHUB_ENV
 
     - name: Build wheels
       run: make wheel
@@ -212,8 +230,9 @@ jobs:
         files: dist/lxml-*.whl
 
     - name: Upload wheels
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
-        name: wheels-${{ matrix.os }}
+        # v4 needs unique names per leg (matrix.os repeats across python versions)
+        name: wheels-${{ matrix.os }}-${{ strategy.job-index }}
         path: dist/lxml-*.whl
         if-no-files-found: ignore

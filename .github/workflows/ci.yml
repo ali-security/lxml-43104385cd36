@@ -1,16 +1,6 @@
 name: CI
 
 on:
-  push:
-    paths:
-      - '**'
-      - '!.github/**'
-      - '.github/workflows/ci.yml'
-  pull_request:
-    paths:
-      - '**'
-      - '!.github/**'
-      - '.github/workflows/ci.yml'
   workflow_dispatch:
 
 concurrency:
@@ -22,6 +12,9 @@ permissions:
 
 jobs:
   ci:
+    # Not a build target: pins retired runner labels and carries continue-on-error.
+    # wheels.yml is the single build+test target.
+    if: false
     strategy:
       # Allows for matrix sub-jobs to fail without canceling the rest
       fail-fast: false
